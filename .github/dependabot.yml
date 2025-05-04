@@ -15,6 +15,14 @@ updates:
     # Check for updates once a month
     schedule:
       interval: "monthly"
+
+    
+  # Ignore Pip updates in /src
+  - package-ecosystem: "pip"
+    directory: "/src"
+    ignore:
+      - dependency-name: "*"
+    
   # Enable version updates for github-actions
   - package-ecosystem: "github-actions"
     # Look for a `Dockerfile` in the `root` directory
