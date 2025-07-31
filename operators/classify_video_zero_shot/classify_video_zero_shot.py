@@ -1,9 +1,9 @@
 import contextlib
+import gc
 import os
 import shutil
 import subprocess
 import tempfile
-from typing import Any
 
 import torch
 from PIL import Image
@@ -17,28 +17,38 @@ class VideoClassifier(Operator):
     """Operator to classify a video into given labels using CLIP-ViT-B-32 and a zero-shot approach."""
 
     def __init__(self) -> None:
-        """Initialize the `VideoClassifier` operator, loads the CLIP model and processor, and validates system dependencies."""
-        super().__init__()
+        """Initialize the `VideoClassifier` operator.
+
+        Loads the CLIP model and processor, validates system dependencies,
+        and sets up the device for inference.
+        """
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.frame_images: list[Image.Image] = []
+        self.labels: list[str] = []
+        self.probs: torch.Tensor | None = None
+        self.fname: str = ""
+
+        self.load_model()
         self.validate_system()
 
+    def load_model(self) -> None:
+        """Load the CLIP model and processor onto the specified device."""
         try:
             self.processor = AutoProcessor.from_pretrained(
                 "openai/clip-vit-base-patch32"
             )
             self.model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-            self.model.to(self.device)
         except Exception as e:
-            raise RuntimeError(f"Failed to load CLIP model or processor: {e}") from e
-
-        self.labels: list[str] = []
-        self.frame_images: list[Image.Image] = []
-        self.probs: torch.Tensor | None = None
+            raise RuntimeError(
+                f"Failed to load the CLIP model or processor: {e!s}"
+            ) from e
+        self.model.to(self.device)
 
     @staticmethod
     def validate_system() -> None:
-        """Validates that required system dependencies are available.
-        (ffmpeg).
+        """Validate that required system dependencies are available.
+
+        Checks if FFmpeg is installed and accessible in the system PATH.
         """
         if shutil.which("ffmpeg") is None:
             raise RuntimeError(
@@ -46,39 +56,40 @@ class VideoClassifier(Operator):
                 "Please install FFmpeg to use this operator."
             )
 
-    def gen_data(self) -> dict[str, Any]:
+    def gen_data(self) -> dict:
         """Generate output dict with prediction and probabilities.
 
         Returns:
             dict: A dictionary containing:
                 - `prediction` (str): Predicted label
-                - `probs` (list): Label probabilities
+                - `probs` (list[float]): Label probabilities
         """
+        if self.probs is None:
+            raise ValueError("No predictions available. Please run analysis first.")
+        if not self.labels:
+            raise ValueError("No labels available. Please run analysis first.")
+
         return {
             "prediction": self.labels[self.probs.argmax().item()],
-            "probs": self.probs.tolist() if self.probs is not None else [],
+            "probs": self.probs.tolist(),
         }
 
     def analyze(self) -> None:
-        """Analyze the video file and generates predictions.
+        """Analyze the video file and generate predictions.
 
-        Args:
-            fname (str): Path to the video file
+        Extracts frames from the video and runs zero-shot classification
+        using the provided labels.
         """
         self.frame_images = self.extract_frames()
         if not self.frame_images:
-            raise RuntimeError(
-                "No frames extracted from video. Check if the video is valid."
-            )
+            raise RuntimeError(f"No frames could be extracted from: {self.fname!s}")
         self.probs = self.predict(self.frame_images, self.labels)
 
     def extract_frames(self) -> list[Image.Image]:
         """Extract I-frames from the video file using ffmpeg.
 
-        Args:
-            fname (str): Path to the video file
         Returns:
-            list: List of PIL Images
+            list[Image.Image]: list of PIL Images
         """
         with tempfile.TemporaryDirectory() as temp_dir:
             cmd = [
@@ -104,8 +115,11 @@ class VideoClassifier(Operator):
                 raise TimeoutError(f"FFmpeg timed out while processing: {self.fname}")
             except subprocess.CalledProcessError as e:
                 raise RuntimeError(
-                    f"FFmpeg failed to extract frames from {self.fname}: {e.stderr}\nStdout: {e.stdout}\nStderr: {e.stderr}"
+                    f"FFmpeg failed to extract frames from {self.fname}: {e.stderr}"
+                    f"Stdout: {e.stdout}\n"
+                    f"Stderr: {e.stderr}"
                 ) from e
+
             frames: list[Image.Image] = []
             for filename in os.listdir(temp_dir):
                 if filename.endswith(".jpg"):
@@ -115,12 +129,12 @@ class VideoClassifier(Operator):
             return frames
 
     def predict(self, images: list[Image.Image], labels: list[str]) -> torch.Tensor:
-        """Run inference and gets label probabilities using a pre-trained
-        CLIP-ViT-B-32.
+        """Run inference and get label probabilities using a pre-trained CLIP-ViT-B-32.
 
         Args:
-            images (list): List of PIL Images
-            labels (list): List of labels
+            images (list[Image.Image]): list of PIL Images
+            labels (list[str]): list of labels
+
         Returns:
             torch.Tensor: Probability distribution across labels
         """
@@ -128,6 +142,7 @@ class VideoClassifier(Operator):
             raise ValueError("Image list for prediction must not be empty.")
         if not labels:
             raise ValueError("Label list for prediction must not be empty.")
+
         inputs = self.processor(
             text=labels,
             images=images,
@@ -136,6 +151,7 @@ class VideoClassifier(Operator):
             truncation=True,
         )
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
         with torch.no_grad():
             output = self.model(**inputs)
             logits_per_image = output.logits_per_image
@@ -147,18 +163,21 @@ class VideoClassifier(Operator):
         file: VideoFactory,
         labels: list[str],
         remove_after_processing: bool = False,
-    ) -> dict[str, Any]:
+    ) -> dict:
         """Run the operator.
 
         Args:
-            file (dict): VideoFactory file object (must have a 'path' key)
-            labels (list): List of labels
+            file (VideoFactory): VideoFactory file object (must have a 'path' key)
+            labels (list[str]): list of labels for classification
             remove_after_processing (bool): Whether to remove the file after processing
+
         Returns:
             dict: A dictionary containing prediction and probabilities
         """
         if not isinstance(file, dict) or "path" not in file:
-            raise TypeError("file must be a dict with a 'path' key from VideoFactory.")
+            raise TypeError(
+                "Invalid file object. Expected VideoFactory object with 'path' key."
+            )
         if not isinstance(labels, list) or not all(isinstance(_, str) for _ in labels):
             raise TypeError("labels must be a list of strings.")
         if not labels:
@@ -188,7 +207,11 @@ class VideoClassifier(Operator):
         del self.processor
         del self.model
 
-    def state(self) -> dict[str, Any]:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def state(self) -> dict:
         """Return the current state of the operator.
 
         Returns:
